@@ -1,89 +1,48 @@
+# tinyagent.py
+
+import os, json, pkgutil, importlib, inspect
 from openai import OpenAI
-import csv, datetime as dt, os, requests
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
-
 client = OpenAI()
 
-# ─── connectors ──────────────────────────────────────────────
-def read_csv(name):
-    with open(f"mem/{name}.csv") as f: return list(csv.DictReader(f))
+CONNECTOR_PACKAGE = "connectors"
+connectors_path = os.path.join(os.path.dirname(__file__), CONNECTOR_PACKAGE)
 
-def write_csv(name, row):
-    fn = f"mem/{name}.csv"
-    exists = os.path.exists(fn)
-    with open(fn, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=row.keys())
-        if not exists: w.writeheader()
-        w.writerow(row)
+# tool_name -> (fn, spec_dict)
+TOOLS: dict[str, tuple[callable, dict]] = {}
 
-def get_calendar_events():
-    # Example: Google Calendar API wrapper
-    # In a real implementation, you would use the Google Calendar API
-    # This is a placeholder that returns mock data
-    events = [
-        {"title": "Team Meeting", "start": "2023-10-10T10:00:00", "end": "2023-10-10T11:00:00"},
-        {"title": "Lunch with Client", "start": "2023-10-10T12:30:00", "end": "2023-10-10T13:30:00"}
-    ]
-    return events
+# Ensure the connectors directory exists
+os.makedirs(connectors_path, exist_ok=True)
 
-# ─── LLM agent call ──────────────────────────────────────────
+for _, module_name, _ in pkgutil.iter_modules([connectors_path]):
+    try:
+        module = importlib.import_module(f"{CONNECTOR_PACKAGE}.{module_name}")
+        for _, fn in inspect.getmembers(module, inspect.isfunction):
+            meta = getattr(fn, "__tool__", None)
+            if not meta:
+                continue
+            # store it in the map
+            TOOLS[meta["name"]] = (fn, meta)
+    except ImportError as e:
+        print(f"Error importing {module_name}: {e}")
+
+# build the OpenAI tools spec
 TOOLS_SPEC = [
     {
         "type": "function",
         "function": {
-            "name": "read_csv",
-            "description": "Fetch memory rows from a CSV file",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Name of the CSV file (without extension)"
-                    }
-                },
-                "required": ["name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_csv",
-            "description": "Write a row to a CSV file",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Name of the CSV file (without extension)"
-                    },
-                    "row": {
-                        "type": "object",
-                        "description": "Data to write as a row"
-                    }
-                },
-                "required": ["name", "row"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_calendar_events",
-            "description": "Fetch calendar events",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
+            "name": name,
+            "description": spec["description"],
+            "parameters": spec["parameters"],
         }
     }
+    for name, (_, spec) in TOOLS.items()
 ]
 
-def agent(msg):
+# ─── Agent & tool dispatch ────────────────────────────────────────────────
+def agent(msg: str):
     return client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": msg}],
@@ -91,57 +50,84 @@ def agent(msg):
         tool_choice="auto"
     )
 
-def process_tool_calls(response):
-    """Process tool calls from the LLM response"""
-    if not hasattr(response, 'choices') or not response.choices:
-        return "No response received"
-    
-    choice = response.choices[0]
-    if not hasattr(choice, 'message') or not hasattr(choice.message, 'tool_calls'):
-        return choice.message.content
-    
-    tool_calls = choice.message.tool_calls
+def summarize_response(original_query, tool_name, raw_result):
+    """Summarize the raw result in human-friendly language"""
+    try:
+        # Convert the result to a string if it's not already
+        if not isinstance(raw_result, str):
+            raw_result = json.dumps(raw_result, indent=2)
+        
+        # Create a prompt for the LLM to summarize the result
+        prompt = f"""
+        The user asked: "{original_query}"
+        
+        The tool "{tool_name}" returned this result:
+        {raw_result}
+        
+        Please provide a concise, human-friendly summary of this information. 
+        Focus on the most important details that answer the user's question.
+        Use natural language and avoid technical jargon.
+        """
+        
+        # Get a summary from the LLM
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300
+        )
+        
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        # If summarization fails, return the original result
+        print(f"Summarization error: {e}")
+        return raw_result
+
+def process_tool_calls(response, original_query):
+    choice = response.choices[0].message
+    if not getattr(choice, "tool_calls", None):
+        return choice.content
+
     results = []
-    
-    for tool_call in tool_calls:
-        function_name = tool_call.function.name
-        function_args = eval(tool_call.function.arguments)
-        
-        if function_name == "read_csv":
-            result = read_csv(**function_args)
-        elif function_name == "write_csv":
-            result = write_csv(**function_args)
-        elif function_name == "get_calendar_events":
-            result = get_calendar_events()
-        else:
-            result = f"Unknown function: {function_name}"
-        
-        results.append(f"{function_name} result: {result}")
-    
+    for call in choice.tool_calls:
+        name = call.function.name
+        args = json.loads(call.function.arguments)
+
+        # look up the real function directly
+        fn, _ = TOOLS[name]
+        try:
+            raw_result = fn(**args)
+            
+            # Summarize the result
+            summarized_result = summarize_response(original_query, name, raw_result)
+            
+            results.append(f"{name} → {summarized_result}")
+        except Exception as e:
+            results.append(f"{name} → Error: {str(e)}")
+
     return "\n".join(results)
 
-def run_agent(user_input):
-    """Run the agent with user input and process any tool calls"""
-    response = agent(user_input)
-    return process_tool_calls(response)
 
-# Example usage
+def run_agent(prompt: str):
+    resp = agent(prompt)
+    return process_tool_calls(resp, prompt)
+
+# ─── Example usage ────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # API key is now loaded from .env file
     if not os.environ.get("OPENAI_API_KEY"):
-        print("Warning: OPENAI_API_KEY not found in environment variables.")
-        print("Please add it to your .env file or set it manually.")
+        print("API key missing; please set OPENAI_API_KEY in your .env")
+        exit(1)
+
+    # ensure mem folder is in place
+    os.makedirs("mem", exist_ok=True)
+
+    print("Available tools:")
+    for name in TOOLS:
+        print(f"- {name}")
     
-    # Create the mem directory if it doesn't exist
-    if not os.path.exists("mem"):
-        os.makedirs("mem")
+    user_q = input("\nEnter your question: ")
+    if not user_q:
+        user_q = "What events do I have tomorrow?"
     
-    # Example: Create a sample CSV file
-    sample_data = {"date": dt.datetime.now().isoformat(), "note": "Initial test note"}
-    write_csv("notes", sample_data)
-    
-    # Example: Run the agent
-    user_query = "What notes do I have saved?"
-    print(f"User: {user_query}")
-    result = run_agent(user_query)
-    print(f"Agent result: {result}")
+    print("\nProcessing...")
+    result = run_agent(user_q)
+    print(f"\nResult:\n{result}")
